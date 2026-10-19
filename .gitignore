@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+dist/
+build/
+installer/
+assets/tetomidi.ico
+tetomidi.log
+midi/
+*.zip
+*.mid
+*.mp3
