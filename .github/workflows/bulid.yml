@@ -1,0 +1,86 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Make icon
+        shell: pwsh
+        run: python make_icon.py
+
+      - name: Build exe
+        shell: pwsh
+        run: pyinstaller tetomidi.spec --noconfirm
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" tetomidi.iss
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tetomidi-setup-windows
+          path: installer/tetomidi-setup.exe
+          compression-level: 0
+
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Make icon
+        run: python make_icon.py
+
+      - name: Build binary
+        run: pyinstaller tetomidi.spec --noconfirm
+
+      - name: Copy config next to the binary
+        run: cp tetomidi.json dist/tetomidi/
+
+      - name: Package
+        run: |
+          cd dist
+          tar -czf tetomidi-linux.tar.gz tetomidi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tetomidi-linux
+          path: dist/tetomidi-linux.tar.gz
+          compression-level: 0
