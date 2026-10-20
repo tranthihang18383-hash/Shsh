@@ -6,6 +6,7 @@ import queue
 import subprocess
 import sys
 import threading
+import math
 import time
 import traceback
 import webbrowser
@@ -15,7 +16,7 @@ from tkinter import filedialog
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageTk
 
-from api_client import ApiClient, BridgeClient
+from api_client import ApiClient, BridgeClient, MultiBridge
 from glass import GlassButton
 from runtime import resource_path
 
@@ -29,7 +30,7 @@ if sys.platform == "win32":
 BG = "#000000"
 TEXT = "#ffffff"
 MUTED = "#8a8a8a"
-W = 460  # content width
+W = 430  # content width
 DISCORD_URL = "https://discord.gg/peaqm6uqgB"
 AUDIO_TYPES = "*.mp3 *.mp4 *.m4a *.wav *.flac *.ogg *.aac *.mkv *.webm"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -89,10 +90,16 @@ def load_config():
 
 
 def make_client(cfg):
-    """'bridge' sends files and links to an existing endpoint; 'server' uses our own server.py."""
+    """'bridge' uses one or more endpoints (first one that answers wins); 'server' uses server.py."""
     if cfg.get("mode") == "bridge":
-        return BridgeClient(cfg["server"], cfg.get("file_path", "/transcribe"),
-                            cfg.get("link_path", "/transcribe-url"), cfg.get("token", ""))
+        endpoints = cfg.get("endpoints") or [{
+            "server": cfg["server"],
+            "file_path": cfg.get("file_path", "/transcribe"),
+            "link_path": cfg.get("link_path", "/transcribe-url"),
+        }]
+        multi = MultiBridge(endpoints, cfg.get("token", ""))
+        multi.start_keepalive(minutes=10)
+        return multi
     return ApiClient(cfg["server"], cfg.get("token", ""))
 
 
@@ -117,6 +124,19 @@ def unique_path(folder, name):
         path = os.path.join(folder, f"{base} ({i}){ext}")
         i += 1
     return path
+
+
+MAX_SECONDS = 40 * 60
+
+
+def _audio_length(path):
+    """Length in seconds, or None if the format cannot be read (then the file is accepted)."""
+    try:
+        from mutagen import File
+        f = File(path)
+        return f.info.length if f is not None and f.info is not None else None
+    except Exception:
+        return None
 
 
 def _folder_icon(size=26):
@@ -172,7 +192,7 @@ class App(ctk.CTk):
         super().__init__()
         ctk.set_appearance_mode("dark")
         self.title("tetomidi")
-        self.geometry("520x820")
+        self.geometry("480x770")
         self.resizable(False, False)
         self.configure(fg_color=BG, background=BG)
 
@@ -315,7 +335,7 @@ class App(ctk.CTk):
     # ---------- layout ----------
     def _build(self):
         wrap = ctk.CTkFrame(self, fg_color=BG)
-        wrap.pack(fill="both", expand=True, padx=30, pady=24)
+        wrap.pack(fill="both", expand=True, padx=26, pady=20)
 
         # Footer first, so it always keeps its space at the bottom
         footer = ctk.CTkFrame(wrap, fg_color=BG)
@@ -354,7 +374,7 @@ class App(ctk.CTk):
                      font=ctk.CTkFont(size=13)).pack(pady=(0, 22))
 
         # Upload box: one click opens the file dialog
-        self.drop = tk.Canvas(wrap, width=W, height=230, bg=BG, highlightthickness=0,
+        self.drop = tk.Canvas(wrap, width=W, height=250, bg=BG, highlightthickness=0,
                               bd=0, cursor="hand2")
         self.drop.pack(pady=(0, 6))
         self._drop_photo = ImageTk.PhotoImage(_note_icon(84))
@@ -398,8 +418,11 @@ class App(ctk.CTk):
                                     boost=1.7, font=ctk.CTkFont(size=16, weight="bold"))
 
         self.status = ctk.CTkLabel(wrap, text="", text_color=MUTED,
-                                   font=ctk.CTkFont(size=12), wraplength=380)
+                                   font=ctk.CTkFont(size=12), wraplength=W - 40)
         self.status.pack(pady=(14, 0))
+        self.hint = ctk.CTkLabel(wrap, text="", text_color=MUTED,
+                                 font=ctk.CTkFont(size=10), wraplength=W - 40)
+        self.hint.pack(pady=(2, 0))
 
         self.bar = ctk.CTkProgressBar(wrap, mode="determinate", height=4,
                                       fg_color="#151515", progress_color=TEXT)
@@ -408,18 +431,19 @@ class App(ctk.CTk):
     def _draw_drop(self, hover):
         c = self.drop
         c.delete("all")
-        x1, y1, x2, y2, r = 4, 4, W - 4, 226, 26
+        x1, y1, x2, y2, r = 4, 4, W - 4, 246, 34
         pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
                x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
-        c.create_polygon(pts, smooth=True, fill="", outline="#8a8a8a" if hover else "#3a3a3a",
-                         width=2, dash=(8, 6))
-        c.create_image(W // 2, 74, image=self._drop_photo)
-        c.create_text(W // 2, 150, text="Choose an audio or video file", fill=TEXT,
+        c.create_polygon(pts, smooth=True, fill="",
+                         outline="#8a8a8a" if hover else "#4a4a4a",
+                         width=3, dash=(10, 7))
+        c.create_image(W // 2, 86, image=self._drop_photo)
+        c.create_text(W // 2, 160, text="Drag & drop your audio file", fill=TEXT,
                       font=("Segoe UI", 15, "bold"))
-        c.create_text(W // 2, 178, text="or click anywhere in this box", fill=MUTED,
-                      font=("Segoe UI", 11))
-        c.create_text(W // 2, 204, text="MP3, MP4, M4A, WAV, FLAC and more", fill=MUTED,
-                      font=("Segoe UI", 9))
+        c.create_text(W // 2, 190, text="or click to browse", fill=MUTED,
+                      font=("Segoe UI", 13))
+        c.create_text(W // 2, 222, text="MP3, WAV, FLAC, M4A and more \u2014 max 40 minutes",
+                      fill=MUTED, font=("Segoe UI", 10))
 
     # ---------- log window ----------
     def _ui_log(self, msg):
@@ -488,11 +512,18 @@ class App(ctk.CTk):
     def pick_file(self):
         p = filedialog.askopenfilename(
             filetypes=[("Audio / Video", AUDIO_TYPES), ("All files", "*.*")])
-        if p:
-            self.src = p
-            self.link_entry.delete(0, "end")
-            self.file_lbl.configure(text=os.path.basename(p), text_color=TEXT)
-            self.status.configure(text="")
+        if not p:
+            return
+        length = _audio_length(p)
+        if length is not None and length > MAX_SECONDS:
+            self.src = None
+            self.file_lbl.configure(text="This file is longer than 40 minutes.",
+                                    text_color="#ff6b6b")
+            return
+        self.src = p
+        self.link_entry.delete(0, "end")
+        self.file_lbl.configure(text=os.path.basename(p), text_color=TEXT)
+        self.status.configure(text="")
 
     def _show_running_ui(self):
         self.go_btn.pack_forget()
@@ -538,6 +569,7 @@ class App(ctk.CTk):
         self.job_id = jid
         self.t0 = time.time()
         self._hb = 0
+        self._last_pct = 0
         self._ui_log(f"Job started on server: {jid[:8]}")
         self.after(800, self._poll)
 
@@ -569,11 +601,16 @@ class App(ctk.CTk):
         elif state == "running":
             p = st.get("progress")
             if p is not None:
-                self.bar.set(p)
-                self.status.configure(text=f"Transcribing to MIDI: ~{int(p * 100)}%")
+                pct = max(1, min(99, int(p * 100)))
             else:
-                self.status.configure(
-                    text=f"Transcribing to MIDI: {minutes} min {int(elapsed % 60)} s")
+                # The endpoint sends no progress, so estimate: approaches 99% over about 3 minutes
+                pct = max(1, min(99, int(99 * (1 - math.exp(-elapsed / 180)))))
+            self.bar.set(pct / 100)
+            self.status.configure(text=f"Transcribing to MIDI: {pct}%")
+            # log every single percent step, so the log shows 1% ... 100%
+            while self._last_pct < pct:
+                self._last_pct += 1
+                self._ui_log(f"Transcribing: {self._last_pct}%")
             if minutes > self._hb:
                 self._hb = minutes
                 self._ui_log(f"Still working, {minutes} min elapsed")
@@ -613,8 +650,17 @@ class App(ctk.CTk):
         self.bar.pack_forget()
         self.busy_btn.pack_forget()
         self.cancel_btn.pack_forget()
-        self._ui_log(text.replace("\n", " "))
-        self.status.configure(text=text)
+        if mid:
+            while self._last_pct < 100:
+                self._last_pct += 1
+                self._ui_log(f"Transcribing: {self._last_pct}%")
+            self._ui_log("Transcriber done!")
+            self.status.configure(text="Transcriber done!", text_color=TEXT)
+            self.hint.configure(text="Open the folder icon to view the MIDI file")
+        else:
+            self._ui_log(text.replace("\n", " "))
+            self.status.configure(text=text, text_color=MUTED)
+            self.hint.configure(text="")
         if mid:
             self.folder = folder
             self.last_mid = mid
@@ -642,7 +688,8 @@ class App(ctk.CTk):
         self.last_mid = None
         self.link_entry.delete(0, "end")
         self.file_lbl.configure(text="No file selected", text_color=MUTED)
-        self.status.configure(text="")
+        self.status.configure(text="", text_color=MUTED)
+        self.hint.configure(text="")
         self.folder_btn.pack_forget()
         self.back_btn.pack_forget()
         self.go_btn.pack()
