@@ -8,6 +8,7 @@ import os
 import re
 import ssl
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -107,10 +108,11 @@ class BridgeClient:
     """
 
     def __init__(self, base, file_path="/transcribe", link_path="/transcribe-url",
-                 token="", timeout=7200):
+                 token="", timeout=7200, cancel_path="/cancel/{job_id}"):
         self.base = base.rstrip("/")
         self.file_path = file_path
         self.link_path = link_path
+        self.cancel_path = cancel_path
         self.token = token
         self.timeout = timeout
         self.jobs = {}
@@ -138,18 +140,20 @@ class BridgeClient:
         except OSError as e:
             raise ApiError(f"Connection problem: {e}")
 
-    def _send_file(self, path, filename, data):
+    def _send_file(self, path, filename, data, job_id):
         boundary = uuid.uuid4().hex
         safe = filename.replace('"', "_")
         head = (f'--{boundary}\r\n'
+                f'Content-Disposition: form-data; name="job_id"\r\n\r\n{job_id}\r\n'
+                f'--{boundary}\r\n'
                 f'Content-Disposition: form-data; name="file"; filename="{safe}"\r\n'
                 'Content-Type: application/octet-stream\r\n\r\n').encode("utf-8")
         tail = f"\r\n--{boundary}--\r\n".encode("utf-8")
         headers = self._headers(f"multipart/form-data; boundary={boundary}")
         return self._request("POST", self.base + path, head + data + tail, headers)
 
-    def _send_link(self, path, url):
-        body = json.dumps({"url": url}).encode("utf-8")
+    def _send_link(self, path, url, job_id):
+        body = json.dumps({"url": url, "job_id": job_id}).encode("utf-8")
         return self._request("POST", self.base + path, body, self._headers("application/json"))
 
     def _extract_midi(self, ctype, disp, data, fallback_name):
@@ -192,7 +196,7 @@ class BridgeClient:
         with self.lock:
             self.jobs[jid] = {"state": "running", "midi": None, "name": "", "error": ""}
         threading.Thread(target=self._run,
-                         args=(jid, lambda: self._send_file(self.file_path, name, data),
+                         args=(jid, lambda: self._send_file(self.file_path, name, data, jid),
                                os.path.splitext(name)[0] + ".mid"),
                          daemon=True).start()
         return jid
@@ -202,7 +206,7 @@ class BridgeClient:
         with self.lock:
             self.jobs[jid] = {"state": "running", "midi": None, "name": "", "error": ""}
         threading.Thread(target=self._run,
-                         args=(jid, lambda: self._send_link(self.link_path, url),
+                         args=(jid, lambda: self._send_link(self.link_path, url, jid),
                                _name_from_url(url) + ".mid"),
                          daemon=True).start()
         return jid
@@ -225,8 +229,112 @@ class BridgeClient:
         return dst_path
 
     def cancel(self, jid):
-        # The remote request cannot be aborted from here, so its result is ignored.
+        # Stop the job on the server (best effort), and ignore its result here.
         with self.lock:
             if jid in self.jobs:
                 self.jobs[jid]["state"] = "cancelled"
-        return {"id": jid, "state": "cancelled"}
+        url = self.base + self.cancel_path.format(job_id=jid)
+        try:
+            self._request("POST", url, b"", self._headers("application/json"))
+            server_ok = True
+        except ApiError:
+            server_ok = False
+        return {"id": jid, "state": "cancelled", "server_notified": server_ok}
+
+
+def _ping(base, token="", timeout=60):
+    """True if something answers at base. Any HTTP reply counts as awake; sleeping or offline does not."""
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    req = urllib.request.Request(base.rstrip("/") + "/", method="GET", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_SSL):
+            return True
+    except urllib.error.HTTPError:
+        return True
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+class MultiBridge:
+    """
+    Several endpoints (e.g. port 3000 and port 8080). The first one that answers is used.
+    A background thread pings all of them now and then, to wake sleeping endpoints.
+    """
+
+    def __init__(self, endpoints, token=""):
+        # endpoints: list of dicts {"server", "file_path", "link_path"}
+        self.clients = [BridgeClient(e["server"], e.get("file_path", "/transcribe"),
+                                     e.get("link_path", "/transcribe-url"), token,
+                                     cancel_path=e.get("cancel_path", "/cancel/{job_id}"))
+                        for e in endpoints]
+        self.token = token
+        self.owner = {}  # job id -> client that received it
+        self.lock = threading.Lock()
+
+    def wake(self):
+        """Ping every endpoint in parallel. Returns the first client that answered, or None."""
+        results = [None] * len(self.clients)
+
+        def run(i, c):
+            results[i] = _ping(c.base, self.token)
+
+        threads = [threading.Thread(target=run, args=(i, c), daemon=True)
+                   for i, c in enumerate(self.clients)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(70)
+        for c, ok in zip(self.clients, results):
+            if ok:
+                return c
+        return None
+
+    def _pick(self):
+        c = self.wake()
+        if c is None:
+            raise ApiError("No endpoint is answering. Try again in a few minutes.")
+        return c
+
+    def health(self):
+        c = self._pick()
+        return {"ok": True, "endpoint": c.base}
+
+    def submit_file(self, path):
+        c = self._pick()
+        jid = c.submit_file(path)
+        with self.lock:
+            self.owner[jid] = c
+        return jid
+
+    def submit_link(self, url):
+        c = self._pick()
+        jid = c.submit_link(url)
+        with self.lock:
+            self.owner[jid] = c
+        return jid
+
+    def _client_for(self, jid):
+        with self.lock:
+            c = self.owner.get(jid)
+        if c is None:
+            raise ApiError("unknown job")
+        return c
+
+    def status(self, jid):
+        return self._client_for(jid).status(jid)
+
+    def download_midi(self, jid, dst_path):
+        return self._client_for(jid).download_midi(jid, dst_path)
+
+    def cancel(self, jid):
+        return self._client_for(jid).cancel(jid)
+
+    def start_keepalive(self, minutes=10):
+        """Ping every endpoint every few minutes while the app is open."""
+        def loop():
+            while True:
+                time.sleep(minutes * 60)
+                for c in self.clients:
+                    _ping(c.base, self.token)
+
+        threading.Thread(target=loop, daemon=True).start()
