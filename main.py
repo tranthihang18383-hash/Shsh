@@ -18,6 +18,7 @@ from PIL import Image, ImageDraw, ImageTk
 
 from api_client import ApiClient, BridgeClient, MultiBridge
 from glass import GlassButton
+from midi_info import format_length, format_tempo, read_midi_info
 from runtime import resource_path
 
 # Give the app its own taskbar identity on Windows
@@ -213,6 +214,8 @@ class App(ctk.CTk):
         self._log_box = None
         self._log_win = None
         self._guide = None
+        self._base_h = 440
+        self._stats_shown = False
 
         self._build()
         self._check_server()
@@ -352,7 +355,8 @@ class App(ctk.CTk):
             h = int(self.winfo_reqheight() / self._scale_of(self)) + 32
         except Exception:
             h = 440
-        self._center_window(self, w, max(h, 300))
+        self._base_h = max(h, 300)
+        self._center_window(self, w, self._base_h)
 
     # ---------- background work ----------
     def _bg(self, fn, on_ok, on_err=None):
@@ -488,6 +492,56 @@ class App(ctk.CTk):
                                       fg_color="#151515", progress_color=TEXT)
         self.bar.set(0)
 
+        # Result table (shown only after a transcription finishes)
+        self.stats = ctk.CTkFrame(wrap, fg_color="#0d0d0d", corner_radius=12,
+                                  border_width=1, border_color="#2a2a2a")
+        self.stat_vals = {}
+        for col, (key, cap) in enumerate((("notes", "NOTES"), ("tempo", "TEMPO BPM"),
+                                          ("length", "LENGTH MM:SS"))):
+            cell = ctk.CTkFrame(self.stats, fg_color="transparent")
+            cell.grid(row=0, column=col, sticky="nsew", padx=2, pady=6)
+            self.stats.grid_columnconfigure(col, weight=1, uniform="stat")
+            val = ctk.CTkLabel(cell, text="-", text_color=TEXT,
+                               font=ctk.CTkFont(size=15, weight="bold"))
+            val.pack()
+            ctk.CTkLabel(cell, text=cap, text_color=MUTED,
+                         font=ctk.CTkFont(size=7)).pack()
+            self.stat_vals[key] = val
+
+    def _show_stats(self, mid):
+        """Fill the table from the finished MIDI file and show it."""
+        try:
+            info = read_midi_info(mid)
+        except Exception as ex:
+            self._ui_log(f"Could not read MIDI info: {ex}")
+            return
+        self.stat_vals["notes"].configure(text=f"{info['notes']:,}")
+        self.stat_vals["tempo"].configure(text=format_tempo(info))
+        self.stat_vals["length"].configure(text=format_length(info["seconds"]))
+        self._ui_log(f"MIDI: {info['notes']} notes, {format_tempo(info)} BPM, "
+                     f"{format_length(info['seconds'])}")
+        if not self._stats_shown:
+            self._stats_shown = True
+            self.stats.pack(fill="x", pady=(8, 0))
+            self._resize_to_content()
+
+    def _hide_stats(self):
+        if self._stats_shown:
+            self._stats_shown = False
+            self.stats.pack_forget()
+            self._resize_to_content()
+
+    def _resize_to_content(self):
+        """Grow/shrink the window for the result table and keep it centred."""
+        try:
+            self.update_idletasks()
+            extra = 44 if self._stats_shown else 0
+            h = self._base_h + extra
+            self.geometry(f"{W + PAD * 2}x{h}")
+            self._center_now()
+        except Exception:
+            pass
+
     def _draw_drop(self, hover):
         c = self.drop
         c.delete("all")
@@ -591,6 +645,7 @@ class App(ctk.CTk):
         self.back_btn.pack_forget()
         self.busy_btn.pack(side="left")
         self.cancel_btn.pack(side="left", padx=(10, 0))
+        self._hide_stats()
         self.bar.set(0)
         self.bar.pack(fill="x", pady=(9, 0), before=self.status)
         self.status.configure(text="Sending to server")
@@ -717,6 +772,7 @@ class App(ctk.CTk):
             self._ui_log("Transcriber done!")
             self.status.configure(text="Transcriber done!", text_color=TEXT)
             self.hint.configure(text="Open the folder icon to view the MIDI file")
+            self._show_stats(mid)
         else:
             self._ui_log(text.replace("\n", " "))
             self.status.configure(text=text, text_color=MUTED)
@@ -752,6 +808,7 @@ class App(ctk.CTk):
         self.hint.configure(text="")
         self.folder_btn.pack_forget()
         self.back_btn.pack_forget()
+        self._hide_stats()
         self.go_btn.pack()
 
 
